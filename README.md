@@ -62,32 +62,41 @@ cd claudesqueeze
 
 ### Configuration
 
-Copy the example config and edit:
+Run the interactive setup wizard:
+
+```bash
+python claudesqueeze.py --configure
+```
+
+The wizard will prompt you for:
+- **API endpoint URL** - Your LLM provider (e.g., `https://api.anthropic.com`, `https://api.z.ai`)
+- **Compression level** - `low`, `medium`, or `high`
+- **Port** - Proxy server port (default: 8080)
+- **Optional features** - Path compression, prompt caching
+
+A `config.yaml` file will be created with your settings.
+
+**Manual configuration** (alternative):
 
 ```bash
 cp config.yaml.example config.yaml
-```
-
-Edit `config.yaml`:
-
-```yaml
-target_api:
-  url: "https://api.anthropic.com"  # Your LLM provider
-
-compression:
-  level: "high"                     # low, medium, high
-  passthrough_mode: false           # Set true to disable compression
-  enable_path_compression: false    # EXPERIMENTAL - may break tool calls
-
-server:
-  port: 8080
-  host: "127.0.0.1"
+# Then edit config.yaml with your settings
 ```
 
 ### Running
 
 ```bash
-python llm_proxy.py --config config.yaml
+# Run with default config
+python claudesqueeze.py
+
+# Run with custom config file
+python claudesqueeze.py --config myconfig.yaml
+
+# Run on different port
+python claudesqueeze.py --port 9000
+
+# Use different compression level
+python claudesqueeze.py --level medium
 ```
 
 You should see:
@@ -272,6 +281,7 @@ compression:
 
 ```
 claudesqueeze/
+├── claudesqueeze.py      # CLI entry point with --configure wizard
 ├── llm_proxy.py          # Main proxy server
 ├── path_compression.py   # Path/URL compression engine
 ├── config.yaml.example   # Example configuration

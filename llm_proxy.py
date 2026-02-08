@@ -36,6 +36,11 @@ ALLOWED_TARGET_HOSTS = [
     "api.groq.com",
     "api.cohere.com",
     "api.mistral.ai",
+    "api.z.ai",
+    "api.moonshot.cn",          # Kimi
+    "api.minimax.chat",         # MiniMax
+    "api.portkey.ai",           # Portkey
+    "generativelanguage.googleapis.com",  # Gemini
 ]
 SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
@@ -1006,6 +1011,155 @@ def run_proxy(port: int = 8080, compression_level: str = "high", config_path: st
 ║  Average Reduction:     {stats['average_reduction_pct']:<5}%                                  ║
 ╚══════════════════════════════════════════════════════════════════╝
         """)
+
+
+def run_setup_wizard(config_path: str = "config.yaml"):
+    """Interactive configuration wizard to set up or update config file."""
+    print("""
+╔══════════════════════════════════════════════════════════════════╗
+║  ClaudeSqueeze Configuration Wizard                             ║
+╚══════════════════════════════════════════════════════════════════╝
+    """)
+
+    # Check if config already exists
+    config_path_obj = Path(config_path)
+    existing_config = None
+    if config_path_obj.exists():
+        try:
+            with open(config_path_obj) as f:
+                existing_config = yaml.safe_load(f)
+            print(f"[INFO] Found existing config at: {config_path}")
+            print("[INFO] The wizard will update your existing settings.")
+            print()
+        except Exception:
+            print("[WARN] Could not read existing config, creating new one.")
+
+    # Gather configuration from user
+    print("Let's configure your LLM API proxy settings.")
+    print("Press Enter to use the [default] value.\n")
+
+    # API Endpoint
+    default_url = "https://api.anthropic.com"
+    if existing_config and "target_api" in existing_config:
+        default_url = existing_config["target_api"].get("url", default_url)
+
+    api_url = input(f"API endpoint URL [{default_url}]: ").strip()
+    if not api_url:
+        api_url = default_url
+
+    # Compression level
+    default_level = "high"
+    if existing_config and "compression" in existing_config:
+        default_level = existing_config["compression"].get("level", default_level)
+
+    print("\nCompression level controls how aggressively prompts are compressed:")
+    print("  - low:    Minimal compression, preserves most detail")
+    print("  - medium: Balanced compression and quality")
+    print("  - high:   Maximum compression, lowest token usage")
+    compression_level = input(f"\nCompression level [low/medium/high] [{default_level}]: ").strip().lower()
+    if not compression_level or compression_level not in ["low", "medium", "high"]:
+        compression_level = default_level
+
+    # Port
+    default_port = 8080
+    if existing_config and "server" in existing_config:
+        default_port = existing_config["server"].get("port", default_port)
+
+    port_input = input(f"\nProxy server port [{default_port}]: ").strip()
+    try:
+        port = int(port_input) if port_input else default_port
+    except ValueError:
+        print(f"[WARN] Invalid port, using default: {default_port}")
+        port = default_port
+
+    # Ask about optional features
+    print("\nOptional features (y/n):")
+
+    enable_path_compression = True
+    if existing_config and "compression" in existing_config:
+        enable_path_compression = existing_config["compression"].get("enable_path_compression", True)
+
+    path_choice = input(f"  Enable path compression (reduces file paths/URLs) [{'y' if enable_path_compression else 'n'}]: ").strip().lower()
+    if path_choice:
+        enable_path_compression = path_choice.startswith('y')
+
+    enable_cache = True
+    if existing_config and "cache_control" in existing_config:
+        enable_cache = existing_config["cache_control"].get("enabled", True)
+
+    cache_choice = input(f"  Enable prompt caching (90% cost reduction on repeated content) [{'y' if enable_cache else 'n'}]: ").strip().lower()
+    if cache_choice:
+        enable_cache = cache_choice.startswith('y')
+
+    # Build config dictionary
+    config = {
+        "target_api": {
+            "url": api_url
+        },
+        "compression": {
+            "level": compression_level,
+            "compress_system": True,
+            "compress_user": True,
+            "compress_assistant": False,
+            "passthrough_mode": False,
+            "enable_path_compression": enable_path_compression
+        },
+        "server": {
+            "port": port,
+            "host": "127.0.0.1",
+            "timeout": 300
+        },
+        "logging": {
+            "level": "info",
+            "log_compression": True,
+            "log_bodies": False,
+            "log_steps": False
+        },
+        "metrics": {
+            "enabled": True,
+            "path": "/metrics"
+        },
+        "cache_control": {
+            "enabled": enable_cache,
+            "cache_roles": ["system"],
+            "cache_first_n_messages": 2
+        },
+        "providers": {
+            "anthropic": {
+                "api_version": "2023-06-01"
+            }
+        }
+    }
+
+    # Write config file
+    try:
+        config_path_obj.parent.mkdir(parents=True, exist_ok=True)
+        with open(config_path_obj, 'w') as f:
+            yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+
+        print(f"""
+╔══════════════════════════════════════════════════════════════════╗
+║  Configuration Saved!                                            ║
+╠══════════════════════════════════════════════════════════════════╣
+║  Config file:    {config_path:<50}║
+║                                                                   ║
+║  Settings:                                                        ║
+║    API Endpoint:      {api_url:<41}║
+║    Compression:       {compression_level.upper():<41}║
+║    Port:              {port:<41}║
+║    Path Compression:  {'ENABLED' if enable_path_compression else 'DISABLED':<41}║
+║    Prompt Caching:    {'ENABLED' if enable_cache else 'DISABLED':<41}║
+╠══════════════════════════════════════════════════════════════════╣
+║  To start the proxy:                                              ║
+║    python claudesqueeze.py --config {config_path:<30}║
+║                                                                   ║
+║  Then configure your client:                                      ║
+║    export ANTHROPIC_BASE_URL=http://localhost:{port}              ║
+╚══════════════════════════════════════════════════════════════════╝
+        """)
+    except Exception as e:
+        print(f"\n[ERROR] Failed to save config: {e}")
+        sys.exit(1)
 
 
 def main():

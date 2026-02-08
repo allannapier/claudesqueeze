@@ -18,7 +18,7 @@ Then configure Claude Code:
 
 import argparse
 import sys
-from llm_proxy import run_proxy
+from llm_proxy import run_proxy, run_setup_wizard
 
 
 def main():
@@ -27,6 +27,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+    # Run the configuration wizard (first-time setup)
+    python claudesqueeze.py --configure
+
     # Run with default config
     python claudesqueeze.py
 
@@ -63,7 +66,17 @@ Examples:
         default="config.yaml",
         help="Path to config file (default: config.yaml)",
     )
+    parser.add_argument(
+        "--configure",
+        action="store_true",
+        help="Run the configuration wizard to set up your config file",
+    )
     args = parser.parse_args()
+
+    # If --configure flag is set, run setup wizard and exit
+    if args.configure:
+        run_setup_wizard(args.config)
+        sys.exit(0)
 
     print("""
 ╔══════════════════════════════════════════════════════════════════╗
