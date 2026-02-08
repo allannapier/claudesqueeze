@@ -25,7 +25,25 @@ import time
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
+
+# Security constants
+MAX_CONTENT_LENGTH = 50 * 1024 * 1024  # 50MB max request size
+MAX_HEADER_LENGTH = 8192  # 8KB max header size
+ALLOWED_TARGET_HOSTS = [
+    "api.anthropic.com",
+    "api.openai.com",
+    "api.groq.com",
+    "api.cohere.com",
+    "api.mistral.ai",
+]
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "X-XSS-Protection": "1; mode=block",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "Content-Security-Policy": "default-src 'none'",
+}
 
 try:
     import requests
@@ -55,7 +73,19 @@ def load_config(config_path: str = None) -> dict:
                 break
 
     if config_path and Path(config_path).exists():
-        with open(config_path) as f:
+        # Validate config path is not a symlink to prevent path traversal
+        config_path_obj = Path(config_path).resolve()
+        if config_path_obj.is_symlink():
+            raise ValueError(f"Config path cannot be a symlink: {config_path}")
+        # Validate config file is readable and within expected directories
+        allowed_roots = [
+            Path.cwd().resolve(),
+            Path(__file__).parent.resolve(),
+            Path.home().resolve() / ".llm-proxy",
+        ]
+        if not any(str(config_path_obj).startswith(str(root)) for root in allowed_roots):
+            raise ValueError(f"Config path outside allowed directories: {config_path}")
+        with open(config_path_obj) as f:
             return yaml.safe_load(f)
 
     # Return default config
@@ -542,6 +572,12 @@ class LLMProxyHandler(BaseHTTPRequestHandler):
     def _handle_chat_request(self):
         """Handle chat completion requests with compression."""
         content_length = int(self.headers.get("Content-Length", 0))
+
+        # Validate content length to prevent memory exhaustion
+        if content_length > MAX_CONTENT_LENGTH:
+            self._send_error(413, f"Request body too large. Max: {MAX_CONTENT_LENGTH} bytes")
+            return
+
         body = self.rfile.read(content_length)
 
         # Log step 1: Request received
@@ -586,7 +622,11 @@ class LLMProxyHandler(BaseHTTPRequestHandler):
                     )
 
             # Determine target API
-            target_url = self._get_target_url()
+            try:
+                target_url = self._get_target_url()
+            except ValueError as e:
+                self._send_error(400, f"Invalid target URL: {e}")
+                return
             print(f"[STEP 5] 🌐 Target API: {target_url}")
 
             headers = self._prepare_headers()
@@ -610,7 +650,7 @@ class LLMProxyHandler(BaseHTTPRequestHandler):
                     json=data,
                     headers=headers,
                     timeout=300,
-                    allow_redirects=True,
+                    allow_redirects=False,  # Disable redirects to prevent SSRF
                     stream=True
                 )
                 print(f"[STEP 7] 📥 Response received: {response.status_code}")
@@ -701,9 +741,20 @@ class LLMProxyHandler(BaseHTTPRequestHandler):
     def _forward_request(self, method: str):
         """Forward request without modification."""
         content_length = int(self.headers.get("Content-Length", 0))
+
+        # Validate content length to prevent memory exhaustion
+        if content_length > MAX_CONTENT_LENGTH:
+            self._send_error(413, f"Request body too large. Max: {MAX_CONTENT_LENGTH} bytes")
+            return
+
         body = self.rfile.read(content_length) if content_length > 0 else b""
 
-        target_url = self._get_target_url()
+        try:
+            target_url = self._get_target_url()
+        except ValueError as e:
+            self._send_error(400, f"Invalid target URL: {e}")
+            return
+
         headers = self._prepare_headers()
 
         try:
@@ -713,19 +764,40 @@ class LLMProxyHandler(BaseHTTPRequestHandler):
                 data=body if body else None,
                 headers=headers,
                 timeout=300,
-                allow_redirects=True
+                allow_redirects=False  # Disable redirects to prevent SSRF
             )
             self._send_response_requests(response)
         except Exception as e:
             self._send_error(500, str(e))
 
     def _get_target_url(self) -> str:
-        """Determine target API URL from config."""
+        """Determine target API URL from config with SSRF protection."""
         # Use target API from config file
         if self.config and "target_api" in self.config:
             base_url = self.config["target_api"].get("url", "https://api.anthropic.com")
         else:
             base_url = "https://api.anthropic.com"
+
+        # Validate base URL to prevent SSRF
+        parsed_base = urlparse(base_url)
+        if parsed_base.scheme not in ("https", "http"):
+            raise ValueError(f"Invalid URL scheme: {parsed_base.scheme}")
+
+        # Check if host is in allowlist (if configured)
+        allowed_hosts = self.config.get("security", {}).get("allowed_hosts", ALLOWED_TARGET_HOSTS)
+        if allowed_hosts and parsed_base.hostname not in allowed_hosts:
+            raise ValueError(f"Host not in allowlist: {parsed_base.hostname}")
+
+        # Validate path to prevent path traversal and SSRF
+        path = self.path.split("?")[0]  # Remove query string
+        # Block paths that attempt traversal or have suspicious patterns
+        dangerous_patterns = [
+            "..", "//", "\\", "@", " ", "\t", "\n", "\r",
+            "#", "%", "\x00", "\x01", "\x02", "\x03",
+        ]
+        for pattern in dangerous_patterns:
+            if pattern in path:
+                raise ValueError(f"Invalid path characters detected: {repr(pattern)}")
 
         # Ensure base_url doesn't end with trailing slash for proper joining
         base_url = base_url.rstrip('/')
@@ -733,15 +805,15 @@ class LLMProxyHandler(BaseHTTPRequestHandler):
         # Construct full URL - path already includes leading slash
         full_url = f"{base_url}{self.path}"
 
-        print(f"[DEBUG] URL Construction:")
-        print(f"        Base URL: {base_url}")
-        print(f"        Path: {self.path}")
-        print(f"        Full URL: {full_url}")
+        # Final validation: ensure constructed URL doesn't redirect to internal addresses
+        parsed_full = urlparse(full_url)
+        if parsed_full.hostname in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
+            raise ValueError("Cannot proxy to localhost/loopback addresses")
 
         return full_url
 
     def _prepare_headers(self) -> dict:
-        """Prepare headers for forwarding to target API."""
+        """Prepare headers for forwarding to target API with security filtering."""
         filtered = {}
         for key, value in self.headers.items():
             key_lower = key.lower()
@@ -758,8 +830,26 @@ class LLMProxyHandler(BaseHTTPRequestHandler):
                 "trailers",
                 "upgrade",
             ):
+                # Validate header value to prevent injection attacks
+                if not self._is_safe_header_value(value):
+                    continue
+                # Limit header length to prevent DoS
+                if len(value) > MAX_HEADER_LENGTH:
+                    value = value[:MAX_HEADER_LENGTH]
                 filtered[key] = value
         return filtered
+
+    def _is_safe_header_value(self, value: str) -> bool:
+        """Check if header value is safe (no injection attempts)."""
+        if not isinstance(value, str):
+            return False
+        # Reject values with newlines to prevent header injection
+        if '\n' in value or '\r' in value:
+            return False
+        # Reject null bytes
+        if '\x00' in value:
+            return False
+        return True
 
     def _send_response(self, response):
         """Send HTTP response back to client."""
@@ -776,7 +866,7 @@ class LLMProxyHandler(BaseHTTPRequestHandler):
         self.wfile.write(content)
 
     def _send_response_requests(self, response):
-        """Send HTTP response back to client (requests library version)."""
+        """Send HTTP response back to client (requests library version) with security headers."""
         self.send_response(response.status_code)
 
         # Check if this is a streaming response
@@ -790,6 +880,9 @@ class LLMProxyHandler(BaseHTTPRequestHandler):
                     self.send_header(key, value)
             # Force connection close after streaming
             self.send_header("Connection", "close")
+            # Add security headers
+            for header, sec_value in SECURITY_HEADERS.items():
+                self.send_header(header, sec_value)
             self.end_headers()
 
             # Stream chunks to client
@@ -810,24 +903,33 @@ class LLMProxyHandler(BaseHTTPRequestHandler):
                     self.send_header(key, value)
 
             self.send_header("Content-Length", len(response.content))
+            # Add security headers
+            for header, sec_value in SECURITY_HEADERS.items():
+                self.send_header(header, sec_value)
             self.end_headers()
             self.wfile.write(response.content)
 
     def _send_json(self, data: dict):
-        """Send JSON response."""
+        """Send JSON response with security headers."""
         content = json.dumps(data).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", len(content))
+        # Add security headers
+        for header, value in SECURITY_HEADERS.items():
+            self.send_header(header, value)
         self.end_headers()
         self.wfile.write(content)
 
     def _send_error(self, code: int, message: str):
-        """Send error response."""
+        """Send error response with security headers."""
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         error_content = json.dumps({"error": message}).encode("utf-8")
         self.send_header("Content-Length", len(error_content))
+        # Add security headers
+        for header, value in SECURITY_HEADERS.items():
+            self.send_header(header, value)
         self.end_headers()
         self.wfile.write(error_content)
 

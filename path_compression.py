@@ -16,6 +16,11 @@ from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass, field
 from collections import defaultdict
 
+# Security constants
+MAX_INPUT_SIZE = 10 * 1024 * 1024  # 10MB max input
+MAX_STRING_CACHE_SIZE = 10000  # Max unique strings to cache
+MAX_PLACEHOLDERS = 5000  # Max placeholders to prevent memory exhaustion
+
 
 @dataclass
 class CompressionMapping:
@@ -44,12 +49,18 @@ class CompressionMapping:
         Get or create placeholder for a repeated string.
         Returns (placeholder, is_new) tuple.
         """
-        h = hashlib.md5(s.encode()).hexdigest()[:12]
+        # Use SHA-256 instead of MD5 for better security
+        h = hashlib.sha256(s.encode()).hexdigest()[:16]
 
         if h in self.string_map:
             original, placeholder, count = self.string_map[h]
             self.string_map[h] = (original, placeholder, count + 1)
             return placeholder, False
+
+        # Limit number of placeholders to prevent memory exhaustion
+        if self._string_counter >= MAX_PLACEHOLDERS:
+            # Return original string if limit reached
+            return s, False
 
         self._string_counter += 1
         placeholder = f"<s{self._string_counter}>"
@@ -110,6 +121,11 @@ class PathCompressionEngine:
         Returns:
             Tuple of (compressed_text, metadata)
         """
+        # Validate input size to prevent memory exhaustion
+        if len(text) > MAX_INPUT_SIZE:
+            # Return original if too large
+            return text, {'paths': 0, 'strings': 0, 'error': 'Input too large'}
+
         original_len = len(text)
         metadata = {'paths': 0, 'strings': 0}
 
@@ -191,14 +207,26 @@ class PathCompressionEngine:
         """Find and deduplicate repeated long strings."""
         lines = text.split('\n')
 
+        # Limit number of lines to prevent memory exhaustion
+        if len(lines) > 100000:
+            # Skip deduplication for very large inputs
+            return text
+
         # Count occurrences of substantial lines
         line_counts = defaultdict(list)
         for i, line in enumerate(lines):
             stripped = line.strip()
             if len(stripped) >= self.MIN_STRING_LENGTH:
+                # Limit line length to prevent hash collision attacks
+                if len(stripped) > 10000:
+                    stripped = stripped[:10000]
                 # Normalize whitespace for matching
                 normalized = ' '.join(stripped.split())
                 line_counts[normalized].append(i)
+                # Limit cache size
+                if len(line_counts) > MAX_STRING_CACHE_SIZE:
+                    # Stop collecting if cache is full
+                    break
 
         # Find lines that appear multiple times
         duplicates = {
