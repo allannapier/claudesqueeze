@@ -1,0 +1,98 @@
+# LLM Compression Proxy Configuration
+# ===================================
+
+# Target API endpoint to forward compressed requests to
+# This is where the proxy will send requests after compression
+target_api:
+  url: "https://api.kimi.com/coding/"
+  # Alternative endpoints for different providers:
+  # anthropic: "https://api.anthropic.com"
+  # openai: "https://api.openai.com"
+  # local: "http://localhost:11434"  # For Ollama
+
+# Compression settings
+compression:
+  # Level: "low", "medium", or "high"
+  level: "high"
+
+  # Whether to compress system prompts
+  compress_system: true
+
+  # Whether to compress user messages
+  compress_user: true
+
+  # Whether to compress assistant messages (usually not needed)
+  compress_assistant: false
+
+  # DEBUG MODE: Set to true to disable compression and just pass through
+  # Useful for verifying the proxy forwarding works before enabling compression
+  passthrough_mode: false
+
+  # EXPERIMENTAL: Path compression (may cause issues with tool calls)
+  # Compresses file paths, URLs, and deduplicates repeated strings
+  # Set to true if you paste lots of code/logs with long paths
+  enable_path_compression: true
+
+# Proxy server settings
+server:
+  # Port to listen on
+  port: 8080
+
+  # Host to bind to (use 127.0.0.1 for localhost only, 0.0.0.0 for all interfaces)
+  host: "127.0.0.1"
+
+  # Request timeout in seconds
+  timeout: 300
+
+# Logging settings
+logging:
+  # Log level: "debug", "info", "warning", "error"
+  level: "debug"
+
+  # Log compression stats for each request
+  log_compression: true
+
+  # Log full request/response bodies (for debugging)
+  log_bodies: true
+
+  # Log each step of request processing
+  log_steps: true
+
+# Metrics settings
+metrics:
+  # Enable metrics endpoint
+  enabled: true
+
+  # Endpoint path
+  path: "/metrics"
+
+# Provider Prompt Caching (Anthropic)
+# ===================================
+# Enables 90% cost reduction on repeated content
+# First request "writes" cache, subsequent "read" at 0.1x cost
+cache_control:
+  # Enable prompt caching
+  enabled: true
+
+  # Which message roles to mark as cacheable
+  cache_roles:
+    - "system"      # System prompts are perfect for caching
+
+  # Cache first N messages of conversation (static context)
+  # Set to 0 to disable, or 2-3 to cache initial context
+  cache_first_n_messages: 2
+
+# Provider-specific settings
+providers:
+  # Anthropic API settings
+  anthropic:
+    api_version: "2023-06-01"
+
+  # OpenAI API settings
+  openai:
+    # No special version header needed
+
+  # Kimi API settings
+  kimi:
+    # Kimi uses Anthropic-compatible format
+    # No special configuration needed
