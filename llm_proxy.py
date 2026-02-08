@@ -37,7 +37,8 @@ ALLOWED_TARGET_HOSTS = [
     "api.cohere.com",
     "api.mistral.ai",
     "api.z.ai",
-    "api.moonshot.cn",          # Kimi
+    "api.moonshot.cn",
+    "api.kimi.com",          # Kimi
     "api.minimax.chat",         # MiniMax
     "api.portkey.ai",           # Portkey
     "generativelanguage.googleapis.com",  # Gemini
@@ -61,6 +62,29 @@ try:
 except ImportError:
     print("Error: pyyaml is required. Install with: pip install pyyaml")
     sys.exit(1)
+
+# Import failover modules - handle both direct and module execution
+try:
+    from account_pool import AccountPool
+    from failover_handler import FailoverHandler, AllAccountsExhaustedError
+    from rate_limiter import RateLimiter
+except ImportError:
+    # Try importing as local modules (when run as module)
+    try:
+        from .account_pool import AccountPool
+        from .failover_handler import FailoverHandler, AllAccountsExhaustedError
+        from .rate_limiter import RateLimiter
+    except ImportError:
+        # Modules not available - define dummy exception and classes
+        AccountPool = None
+        FailoverHandler = None
+        RateLimiter = None
+
+        # Define dummy exception for compatibility
+        class AllAccountsExhaustedError(Exception):
+            def __init__(self, status):
+                self.status = status
+                super().__init__(f"All accounts exhausted. Status: {status}")
 
 
 def load_config(config_path: str = None) -> dict:
@@ -544,6 +568,8 @@ class LLMProxyHandler(BaseHTTPRequestHandler):
     compressor = CompressionEngine(level="high")
     metrics = MetricsCollector()
     config = None  # Set at startup from proxy_config.yaml
+    account_pool = None  # Set at startup for account failover
+    failover_handler = None  # Set at startup for automatic failover
 
     def do_GET(self):
         """Handle GET requests (for health checks, etc.)."""
@@ -650,20 +676,91 @@ class LLMProxyHandler(BaseHTTPRequestHandler):
             # Use requests library instead of httpx (better DNS handling)
             try:
                 print(f"[STEP 6d] Sending request via requests library...")
-                response = requests.post(
-                    target_url,
-                    json=data,
-                    headers=headers,
-                    timeout=300,
-                    allow_redirects=False,  # Disable redirects to prevent SSRF
-                    stream=True
-                )
+
+                # Define the request function for failover handler
+                def make_request(account, data, headers):
+                    """Make request with the given account's API key and endpoint."""
+                    # Use account's endpoint if specified, otherwise fall back to global target_url
+                    if account.endpoint:
+                        # Account endpoint is the FULL URL (use it directly without appending path)
+                        url = account.endpoint.rstrip('/')  # Remove trailing slash to avoid double slashes
+                        # Add query string from original request if not present
+                        if '?' in target_url:
+                            query_part = target_url.split('?', 1)[1]
+                            separator = '&' if '?' in url else '?'
+                            url = f"{url}{separator}{query_part}"
+                        print(f"[STEP 6e] Using account endpoint: {account.name} ({account.id})")
+                        print(f"[STEP 6f] Full URL: {url}")
+                    else:
+                        # No account endpoint, use global target_url
+                        url = target_url
+                        print(f"[STEP 6e] Using account: {account.name} ({account.id})")
+                        print(f"[STEP 6f] Endpoint: {url}")
+                    return requests.post(
+                        url,
+                        json=data,
+                        headers=headers,
+                        timeout=300,
+                        allow_redirects=False,  # Disable redirects to prevent SSRF
+                        stream=True
+                    )
+
+                # Use failover handler if configured, otherwise direct request
+                if self.failover_handler:
+                    print(f"[STEP 6e] Using failover handler for automatic account switching")
+                    response = self.failover_handler.execute_stream_with_failover(
+                        make_request,
+                        data,
+                        headers,
+                        target_url
+                    )
+                else:
+                    # Direct request without failover (single account mode)
+                    response = requests.post(
+                        target_url,
+                        json=data,
+                        headers=headers,
+                        timeout=300,
+                        allow_redirects=False,  # Disable redirects to prevent SSRF
+                        stream=True
+                    )
+
                 print(f"[STEP 7] 📥 Response received: {response.status_code}")
+
+                # Debug: log response details
+                content_type = response.headers.get('Content-Type', 'unknown')
+                content_length = response.headers.get('Content-Length', 'unknown')
+                transfer_encoding = response.headers.get('Transfer-Encoding', 'none')
+                location = response.headers.get('location', 'none')
+                print(f"[DEBUG] Content-Type: {content_type}")
+                print(f"[DEBUG] Content-Length: {content_length}")
+                print(f"[DEBUG] Transfer-Encoding: {transfer_encoding}")
+                print(f"[DEBUG] Location: {location}")
+                print(f"[DEBUG] Headers: {list(response.headers.keys())}")
+
+                # For redirects, log where it's trying to redirect to
+                if response.status_code in [301, 302, 303, 307, 308]:
+                    print(f"[WARN] Got {response.status_code} redirect to: {location}")
+                    print(f"[WARN] Proxy does not follow redirects for security reasons")
+                    print(f"[WARN] Update your account endpoint to the correct URL")
+
+                # For non-streaming responses (small JSON), log the body
+                if 'application/json' in content_type:
+                    try:
+                        body = response.text
+                        if body:
+                            print(f"[DEBUG] Response body: {body}")
+                    except:
+                        pass
 
                 # Return response to client
                 self._send_response_requests(response)
                 print(f"[STEP 8] ✅ Response sent back to Claude Code\n")
 
+            except AllAccountsExhaustedError as e:
+                print(f"[ERROR] ❌ All accounts exhausted or rate-limited")
+                print(f"        Status: {e.status}")
+                self._send_error(503, "All API accounts are currently rate-limited. Please try again later.")
             except requests.exceptions.ConnectionError as e:
                 print(f"[ERROR] ❌ Connection failed: {e}")
                 print(f"        Target URL: {target_url}")
@@ -891,15 +988,20 @@ class LLMProxyHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
             # Stream chunks to client
+            chunk_count = 0
+            total_bytes = 0
             try:
                 for chunk in response.iter_content(chunk_size=8192):
                     if chunk:
                         self.wfile.write(chunk)
                         self.wfile.flush()
+                        chunk_count += 1
+                        total_bytes += len(chunk)
             except (BrokenPipeError, ConnectionResetError):
                 # Client closed connection - this is normal for streaming
                 pass
             finally:
+                print(f"[DEBUG] Streaming complete: {chunk_count} chunks, {total_bytes} bytes")
                 response.close()
         else:
             # For regular responses, send complete content
@@ -907,12 +1009,18 @@ class LLMProxyHandler(BaseHTTPRequestHandler):
                 if key.lower() not in ("content-encoding", "transfer-encoding", "content-length"):
                     self.send_header(key, value)
 
-            self.send_header("Content-Length", len(response.content))
+            content = response.content
+            self.send_header("Content-Length", len(content))
             # Add security headers
             for header, sec_value in SECURITY_HEADERS.items():
                 self.send_header(header, sec_value)
             self.end_headers()
-            self.wfile.write(response.content)
+
+            # Debug log small responses (likely errors)
+            if len(content) < 200:
+                print(f"[DEBUG] Small response body ({len(content)} bytes): {content.decode('utf-8', errors='replace')}")
+
+            self.wfile.write(content)
 
     def _send_json(self, data: dict):
         """Send JSON response with security headers."""
@@ -968,11 +1076,50 @@ def run_proxy(port: int = 8080, compression_level: str = "high", config_path: st
     # Get target API from config
     target_api = config.get("target_api", {}).get("url", "https://api.anthropic.com") if config else "https://api.anthropic.com"
 
+    # Initialize account pool and failover handler if configured
+    failover_enabled = False
+    accounts_config = config.get("accounts", []) if config else []
+    failover_config = config.get("failover", {}) if config else {}
+
+    if accounts_config and len(accounts_config) > 1 and failover_config.get("enabled", True):
+        try:
+            strategy = failover_config.get("strategy", "priority")
+
+            # Check if failover modules are available
+            if AccountPool is None or FailoverHandler is None:
+                print(f"[WARN] Failover modules not found. Running in single-account mode.")
+                print(f"[WARN] Ensure account_pool.py and failover_handler.py are in the same directory.")
+            else:
+                LLMProxyHandler.account_pool = AccountPool(accounts_config, strategy=strategy)
+
+                LLMProxyHandler.failover_handler = FailoverHandler(
+                    account_pool=LLMProxyHandler.account_pool,
+                    max_retries=failover_config.get("max_retries", len(accounts_config)),
+                    backoff_multiplier=failover_config.get("backoff_multiplier", 2.0),
+                    max_backoff_seconds=failover_config.get("max_backoff_seconds", 300),
+                    default_backoff_seconds=failover_config.get("cooldown_seconds", 60),
+                )
+                failover_enabled = True
+                print(f"[FAILOVER] Enabled with {len(accounts_config)} accounts (strategy: {strategy})")
+        except Exception as e:
+            print(f"[WARN] Failed to initialize failover: {e}")
+            print(f"[WARN] Running in single-account mode")
+    elif accounts_config:
+        print(f"[INFO] Single account configured - failover disabled")
+        print(f"[INFO] Add multiple accounts to enable automatic failover")
+
     # Check if passthrough mode is enabled
     passthrough = config.get("compression", {}).get("passthrough_mode", False) if config else False
     mode_str = "PASSTHROUGH (no compression)" if passthrough else f"COMPRESSION ({compression_level})"
 
     server = ThreadingHTTPServer(("localhost", port), LLMProxyHandler)
+
+    # Build failover status string
+    if failover_enabled and LLMProxyHandler.account_pool:
+        num_accounts = len(LLMProxyHandler.account_pool.get_all_accounts())
+        failover_status = f"ENABLED ({num_accounts} accounts)"
+    else:
+        failover_status = "disabled"
 
     print(f"""
 ╔══════════════════════════════════════════════════════════════════╗
@@ -982,6 +1129,7 @@ def run_proxy(port: int = 8080, compression_level: str = "high", config_path: st
 ║  Mode:            {mode_str:<45}║
 ║  Target API:      {target_api:<45}║
 ║  Path Compress:   {path_comp_status:<45}║
+║  Auto Failover:   {failover_status:<45}║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  Configure Claude Code:                                          ║
 ║    export ANTHROPIC_BASE_URL=http://localhost:{port}              ║
@@ -1091,11 +1239,101 @@ def run_setup_wizard(config_path: str = "config.yaml"):
     if cache_choice:
         enable_cache = cache_choice.startswith('y')
 
+    # Account configuration for failover
+    print("\n" + "="*66)
+    print("API ACCOUNT CONFIGURATION (for automatic failover)")
+    print("="*66)
+    print("\nYou can configure multiple API accounts for automatic failover.")
+    print("When one account hits rate limits (429 error), the proxy will")
+    print("automatically switch to the next available account.\n")
+
+    # Get existing accounts if available
+    existing_accounts = existing_config.get("accounts", []) if existing_config else []
+
+    if existing_accounts:
+        print(f"[INFO] Found {len(existing_accounts)} existing account(s)")
+        keep_existing = input(f"Keep existing accounts and add more? [{'y'}/n]: ").strip().lower()
+        if keep_existing.startswith('n'):
+            existing_accounts = []
+            print("[INFO] Existing accounts will be replaced")
+
+    accounts = list(existing_accounts)
+
+    # Add new accounts
+    while True:
+        print(f"\n--- Configure Account {len(accounts) + 1} ---")
+        print("(Leave API key blank to finish adding accounts)")
+
+        api_key = input(f"API key for account {len(accounts) + 1}: ").strip()
+
+        if not api_key:
+            if len(accounts) == 0:
+                print("[WARN] At least one account is required. Please enter an API key.")
+                continue
+            break
+
+        account_name = input(f"Account name (e.g., 'Primary', 'Backup') [Account {len(accounts) + 1}]: ").strip()
+        if not account_name:
+            account_name = f"Account {len(accounts) + 1}"
+
+        account_id = input(f"Account ID (unique identifier) [account_{len(accounts) + 1}]: ").strip().lower()
+        if not account_id:
+            account_id = f"account_{len(accounts) + 1}"
+
+        # Ask for account-specific endpoint (optional - uses global target_api.url if not specified)
+        print("\n  You can specify a different API endpoint for this account.")
+        print(f"  This should be the FULL URL including the path (e.g., https://api.z.ai/api/anthropic/v1/messages)")
+        print(f"  Leave blank to use the global endpoint: {api_url}")
+        account_endpoint = input(f"  Endpoint for this account (full URL, or press Enter to use global): ").strip()
+        if not account_endpoint:
+            account_endpoint = None  # Will use global target_api.url
+
+        accounts.append({
+            "id": account_id,
+            "name": account_name,
+            "api_key": api_key,
+            "endpoint": account_endpoint,  # Per-account endpoint
+            "priority": len(accounts) + 1,
+        })
+
+        print(f"\n[INFO] Added account: {account_name} ({account_id})")
+
+        # Ask if they want to add more
+        if len(accounts) >= 2:
+            add_more = input(f"\nAdd another account? [{'y'}/n]: ").strip().lower()
+            if add_more.startswith('n'):
+                break
+        else:
+            print("\n[INFO] Add at least 2 accounts to enable automatic failover")
+            add_more = input(f"Add another account? [{'y'}/n]: ").strip().lower()
+            if add_more.startswith('n'):
+                break
+
+    # Configure failover settings if multiple accounts
+    failover_config = {"enabled": len(accounts) > 1}
+    if len(accounts) > 1:
+        print("\n--- Failover Settings ---")
+        print("Strategy: How accounts are selected when one fails")
+        print("  - priority: Use accounts in order (1, 2, 3...)")
+        print("  - round_robin: Rotate through accounts evenly")
+
+        strategy = input(f"Selection strategy [priority/round_robin] [priority]: ").strip().lower()
+        if strategy not in ["priority", "round_robin"]:
+            strategy = "priority"
+
+        failover_config["strategy"] = strategy
+        failover_config["max_retries"] = len(accounts)
+        failover_config["backoff_multiplier"] = 2.0
+        failover_config["max_backoff_seconds"] = 300
+        failover_config["cooldown_seconds"] = 3600  # 1 hour default - don't retry failed accounts quickly
+
     # Build config dictionary
     config = {
         "target_api": {
             "url": api_url
         },
+        "accounts": accounts,
+        "failover": failover_config,
         "compression": {
             "level": compression_level,
             "compress_system": True,
@@ -1137,6 +1375,10 @@ def run_setup_wizard(config_path: str = "config.yaml"):
         with open(config_path_obj, 'w') as f:
             yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
+        # Build account summary
+        num_accounts = len(accounts)
+        failover_status = "ENABLED" if num_accounts > 1 else "disabled (need 2+ accounts)"
+
         print(f"""
 ╔══════════════════════════════════════════════════════════════════╗
 ║  Configuration Saved!                                            ║
@@ -1149,6 +1391,8 @@ def run_setup_wizard(config_path: str = "config.yaml"):
 ║    Port:              {port:<41}║
 ║    Path Compression:  {'ENABLED' if enable_path_compression else 'DISABLED':<41}║
 ║    Prompt Caching:    {'ENABLED' if enable_cache else 'DISABLED':<41}║
+║    Accounts:          {num_accounts} configured{' (' + ', '.join([a.get('name', a['id']) for a in accounts[:3]]) + ')' if num_accounts > 0 else '':<21}║
+║    Auto Failover:     {failover_status:<41}║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  To start the proxy:                                              ║
 ║    python claudesqueeze.py --config {config_path:<30}║

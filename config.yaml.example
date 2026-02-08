@@ -8,7 +8,66 @@ target_api:
   # Alternative endpoints for different providers:
   # anthropic: "https://api.anthropic.com"
   # openai: "https://api.openai.com"
+  # z_ai: "https://api.z.ai"
+  # kimi: "https://api.moonshot.cn"
   # local: "http://localhost:11434"  # For Ollama
+
+# API Accounts for Automatic Failover
+# ====================================
+# Configure multiple API accounts for automatic failover when one hits rate limits.
+# When a 429 error is received, the proxy will automatically switch to the next account.
+accounts:
+  # Primary account
+  - id: primary
+    name: "Primary Account"
+    api_key: "sk-ant-your-primary-api-key-here"
+    endpoint: null  # Uses target_api.url above, or specify custom endpoint
+    priority: 1
+    max_retries: 3
+    retry_delay_ms: 1000
+
+  # Backup account (optional - enables automatic failover)
+  # You can specify a different endpoint for each account (e.g., different provider)
+  # - id: backup
+  #   name: "Backup Account"
+  #   api_key: "sk-ant-your-backup-api-key-here"
+  #   endpoint: "https://api.z.ai"  # Custom endpoint for this account
+  #   priority: 2
+  #   max_retries: 3
+  #   retry_delay_ms: 1000
+
+  # Tertiary account (optional - example with environment variable)
+  # - id: tertiary
+  #   name: "Tertiary Account"
+  #   api_key: "${BACKUP_API_KEY}"
+  #   endpoint: "https://api.moonshot.cn"  # Kimi endpoint
+  #   priority: 3
+
+# Failover Settings
+# =================
+# Controls how the proxy switches between accounts during rate limits
+failover:
+  # Enable automatic failover (requires 2+ accounts)
+  enabled: true
+
+  # Account selection strategy:
+  # - "priority": Use accounts in priority order (1, 2, 3...)
+  # - "round_robin": Rotate through accounts evenly
+  strategy: "priority"
+
+  # Maximum retry attempts before giving up
+  max_retries: 3
+
+  # Exponential backoff multiplier
+  backoff_multiplier: 2.0
+
+  # Maximum backoff time in seconds
+  max_backoff_seconds: 300
+
+  # Default cooldown when account is rate-limited (if API doesn't provide retry-after)
+  # Once an account fails, we won't retry it for this long (default: 1 hour)
+  # This ensures we "stick" with the working account instead of constantly retrying failed ones
+  cooldown_seconds: 3600  # 1 hour
 
 # Compression settings
 compression:
