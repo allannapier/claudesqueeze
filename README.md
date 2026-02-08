@@ -105,21 +105,31 @@ You should see:
 
 ### Configure Claude Code
 
-Set environment variables before running Claude Code:
+Claude Code uses a settings.json file for configuration. Update your user-level settings:
 
-```bash
-export ANTHROPIC_BASE_URL=http://localhost:8080
-export ANTHROPIC_API_KEY=your-api-key
-claude
+**Location:** `~/.claude/settings.json`
+
+Add or update the following:
+
+```json
+{
+  "anthropicBaseUrl": "http://localhost:8080",
+  "anthropicApiKey": "your-api-key"
+}
 ```
 
-Or for Kimi:
+**For Kimi or other providers:**
 
-```bash
-export ANTHROPIC_BASE_URL=http://localhost:8080
-export ANTHROPIC_API_KEY=your-kimi-api-key
-claude
+```json
+{
+  "anthropicBaseUrl": "http://localhost:8080",
+  "anthropicApiKey": "your-kimi-api-key"
+}
 ```
+
+**Note:** Claude Code uses the Anthropic API format internally. The proxy handles translation to other providers.
+
+After updating settings, restart Claude Code for changes to take effect.
 
 ---
 
